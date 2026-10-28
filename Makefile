@@ -1,6 +1,8 @@
 
 CC = gcc
 
+KERNEL_SOURCE = kernel/main.c
+
 CFLAGS = -std=gnu11 -O2 -Wall -Wextra \
          -ffreestanding -fno-stack-protector \
          -fno-pic -fno-pie -m64 -mno-red-zone \
@@ -16,11 +18,11 @@ LDFLAGS = -nostdlib -static -no-pie \
 
 all: kernel.elf
 
-# Compile the kernel source into an ELF executable.
-kernel.elf: kernel/main.c linker.ld limine/limine.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ kernel/main.c
+kernel.elf: $(KERNEL_SOURCE) linker.ld limine/limine.h
+	@test -f "$(KERNEL_SOURCE)" || \
+	  (echo "ERROR: Kernel source not found: $(KERNEL_SOURCE)"; exit 1)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(KERNEL_SOURCE)
 
-# Package the kernel into a bootable ISO.
 iso: kernel.elf
 	mkdir -p iso_root/boot iso_root/EFI/BOOT
 

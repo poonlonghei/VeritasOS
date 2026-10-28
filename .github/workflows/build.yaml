@@ -41,6 +41,20 @@ jobs:
           test -f limine/BOOTX64.EFI
           test -x limine/limine
 
+      - name: Inspect repository files
+        run: |
+          echo "Current directory:"
+          pwd
+
+          echo "Repository files:"
+          ls -la
+
+          echo "Kernel directory:"
+          ls -la kernel/ || true
+
+          echo "Find C source files:"
+          find . -type f -name '*.c' -not -path './limine/.git/*'
+
       - name: Build VeritasOS
         run: make iso CC=gcc
 
