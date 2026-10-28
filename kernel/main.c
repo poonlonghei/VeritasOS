@@ -5,7 +5,7 @@
 
 /* VeritasOS 0.2.0: framebuffer desktop + polled PS/2 input. */
 #define OS_NAME    "VeritasOS"
-#define OS_VERSION "0.2.0"
+#define OS_VERSION "0.3.0"
 
 __attribute__((used, section(".limine_requests_start")))
 static volatile LIMINE_REQUESTS_START_MARKER;
@@ -32,7 +32,7 @@ static uint8_t mouse_packet[3];
 static unsigned mouse_packet_index;
 static char input_line[48];
 static size_t input_length;
-static const char *status_message = "READY - TYPE ON YOUR KEYBOARD OR CLICK THE DESKTOP";
+static const char *status_message = "READY - CLICK DESKTOP ICONS OR DOCK";
 
 static void halt_cpu(void) {
     for (;;) __asm__ volatile ("hlt");
@@ -279,66 +279,161 @@ static void draw_cursor(int x, int y) {
     cursor_visible = true;
 }
 
+enum window_kind { WIN_NONE, WIN_HOME, WIN_FILES, WIN_SETTINGS };
+static enum window_kind active_window = WIN_HOME;
 static int win_x, win_y, win_w, win_h;
 static int dock_x, dock_y, dock_w, dock_h;
+static bool power_menu_open;
+static bool dragging_window;
+static int drag_offset_x, drag_offset_y;
+static bool show_clock = true;
+static bool dark_theme = true;
+static bool show_desktop_icons = true;
+static unsigned long uptime_ticks;
+
+static void rtc_read_time(char out[9]) {
+    uint8_t sec, min, hour, status_b;
+    /* Read CMOS RTC time. Retry if seconds change during the read. */
+    for (unsigned retry = 0; retry < 4; ++retry) {
+        outb(0x70, 0x00); sec = inb(0x71);
+        outb(0x70, 0x02); min = inb(0x71);
+        outb(0x70, 0x04); hour = inb(0x71);
+        outb(0x70, 0x0B); status_b = inb(0x71);
+        outb(0x70, 0x00);
+        if ((inb(0x71) & 0x7Fu) == (sec & 0x7Fu)) break;
+    }
+    bool pm = (hour & 0x80u) != 0;
+    hour &= 0x7Fu;
+    if ((status_b & 0x04u) == 0) {
+        sec = (uint8_t)(((sec >> 4) * 10u) + (sec & 0x0Fu));
+        min = (uint8_t)(((min >> 4) * 10u) + (min & 0x0Fu));
+        hour = (uint8_t)(((hour >> 4) * 10u) + (hour & 0x0Fu));
+    }
+    if ((status_b & 0x02u) == 0) {
+        hour = (uint8_t)(hour % 12u);
+        if (pm) hour = (uint8_t)(hour + 12u);
+    }
+    out[0] = (char)('0' + ((hour / 10u) % 10u));
+    out[1] = (char)('0' + (hour % 10u)); out[2] = ':';
+    out[3] = (char)('0' + ((min / 10u) % 10u));
+    out[4] = (char)('0' + (min % 10u)); out[5] = ':';
+    out[6] = (char)('0' + ((sec / 10u) % 10u));
+    out[7] = (char)('0' + (sec % 10u)); out[8] = '\0';
+}
+
+static void draw_icon(int x, int y, const char *label, uint8_t r, uint8_t g, uint8_t b) {
+    rectangle(x, y, 34, 30, r, g, b);
+    rectangle(x + 4, y + 4, 26, 22, 235, 241, 252);
+    rectangle(x + 8, y + 8, 18, 14, r, g, b);
+    draw_text(x - 2, y + 36, label, 240, 244, 255);
+}
+
+static void draw_window(void) {
+    if (active_window == WIN_NONE) return;
+    int w = (int)screen_w, h = (int)screen_h;
+    win_w = w * 2 / 3;
+    if (win_w > 620) win_w = 620;
+    if (win_w < 260) win_w = w - 20;
+    win_h = h * 2 / 3;
+    if (win_h > 390) win_h = 390;
+    if (win_h < 150) win_h = h - 80;
+    if (win_x == 0 && win_y == 0) {
+        win_x = (w - win_w) / 2;
+        win_y = (h - win_h) / 2 - 8;
+    }
+    if (win_x < 0) win_x = 0;
+    if (win_y < 42) win_y = 42;
+    if (win_x + win_w > w) win_x = w - win_w;
+    if (win_y + win_h > h - 66) win_y = h - 66 - win_h;
+
+    rectangle(win_x + 5, win_y + 6, win_w, win_h, 7, 10, 20);
+    rectangle(win_x, win_y, win_w, win_h, dark_theme ? 43 : 225,
+              dark_theme ? 55 : 232, dark_theme ? 78 : 241);
+    rectangle(win_x, win_y, win_w, 38, 28, 39, 59);
+    rectangle(win_x, win_y + 37, win_w, 1, 82, 101, 135);
+    rectangle(win_x + 13, win_y + 13, 11, 11, 255, 103, 119);
+    rectangle(win_x + 31, win_y + 13, 11, 11, 255, 195, 91);
+    rectangle(win_x + 49, win_y + 13, 11, 11, 95, 222, 155);
+
+    if (active_window == WIN_HOME) {
+        draw_text(win_x + 72, win_y + 15, "WELCOME", 242, 245, 255);
+        draw_text(win_x + 22, win_y + 62, "WELCOME TO VERITASOS", 247, 249, 255);
+        draw_text(win_x + 22, win_y + 84, "A DESKTOP BUILT FROM C", 183, 205, 237);
+        draw_text(win_x + 22, win_y + 106, "VERSION 0.3.0", 183, 205, 237);
+        rectangle(win_x + 22, win_y + 128, win_w - 44, 1, 91, 111, 147);
+        draw_text(win_x + 22, win_y + 145, "INPUT STATUS", 242, 245, 255);
+        draw_text(win_x + 22, win_y + 163, status_message, 174, 208, 190);
+        if (input_length) {
+            draw_text(win_x + 22, win_y + 185, "KEYS:", 183, 205, 237);
+            draw_text(win_x + 58, win_y + 185, input_line, 255, 215, 140);
+        }
+        draw_text(win_x + 22, win_y + win_h - 25, "TIP: DRAG THIS TITLE BAR TO MOVE THE WINDOW", 185, 200, 226);
+    } else if (active_window == WIN_FILES) {
+        draw_text(win_x + 72, win_y + 15, "FILE MANAGER", 242, 245, 255);
+        draw_text(win_x + 22, win_y + 61, "VERITASOS FILE MANAGER", 247, 249, 255);
+        draw_text(win_x + 22, win_y + 84, "DEMO DIRECTORY: /", 183, 205, 237);
+        draw_text(win_x + 22, win_y + 112, "[DIR]  SYSTEM", 174, 208, 190);
+        draw_text(win_x + 22, win_y + 134, "[DIR]  HOME", 174, 208, 190);
+        draw_text(win_x + 22, win_y + 156, "[FILE] KERNEL.ELF", 255, 215, 140);
+        draw_text(win_x + 22, win_y + 178, "[FILE] LIMINE.CONF", 255, 215, 140);
+        draw_text(win_x + 22, win_y + 200, "DEMO ONLY - DISK FILESYSTEM NOT YET IMPLEMENTED", 220, 190, 160);
+    } else if (active_window == WIN_SETTINGS) {
+        draw_text(win_x + 72, win_y + 15, "SETTINGS", 242, 245, 255);
+        draw_text(win_x + 22, win_y + 61, "DESKTOP SETTINGS", 247, 249, 255);
+        draw_text(win_x + 22, win_y + 88, dark_theme ? "THEME: DARK (CLICK TO CHANGE)" : "THEME: LIGHT (CLICK TO CHANGE)", 183, 205, 237);
+        draw_text(win_x + 22, win_y + 116, show_clock ? "CLOCK: VISIBLE (CLICK TO HIDE)" : "CLOCK: HIDDEN (CLICK TO SHOW)", 183, 205, 237);
+        draw_text(win_x + 22, win_y + 144, show_desktop_icons ? "DESKTOP ICONS: VISIBLE" : "DESKTOP ICONS: HIDDEN", 183, 205, 237);
+        draw_text(win_x + 22, win_y + 178, "CLICK INSIDE THIS WINDOW TO CHANGE THEME", 174, 208, 190);
+        draw_text(win_x + 22, win_y + 198, "CLOCK USES THE VIRTUAL MACHINE RTC", 174, 208, 190);
+    }
+}
 
 static void draw_desktop(void) {
     int w = (int)screen_w, h = (int)screen_h;
-
-    /* Deep navy background with broad horizontal color bands. */
-    rectangle(0, 0, w, h, 17, 25, 44);
-    rectangle(0, 42, w, h - 42, 20, 30, 53);
-    rectangle(0, h / 2, w, h / 2, 22, 32, 57);
-
-    /* Top panel. */
+    rectangle(0, 0, w, h, dark_theme ? 17 : 190, dark_theme ? 25 : 207, dark_theme ? 44 : 230);
+    rectangle(0, 42, w, h - 42, dark_theme ? 20 : 205, dark_theme ? 30 : 220, dark_theme ? 53 : 235);
+    rectangle(0, h / 2, w, h / 2, dark_theme ? 22 : 212, dark_theme ? 32 : 225, dark_theme ? 57 : 238);
     rectangle(0, 0, w, 42, 11, 17, 31);
     rectangle(0, 41, w, 1, 49, 73, 111);
     draw_text(18, 17, OS_NAME, 240, 244, 255);
     draw_text(112, 17, "DESKTOP", 120, 157, 205);
-    if (w > 150) draw_text(w - 105, 17, OS_VERSION, 180, 199, 225);
+    if (show_clock && w > 260) {
+        char clock_text[9];
+        rtc_read_time(clock_text);
+        draw_text(w - 74, 17, clock_text, 240, 244, 255);
+    } else if (w > 150) draw_text(w - 105, 17, OS_VERSION, 180, 199, 225);
 
-    /* Main window with a subtle shadow. */
-    win_w = w * 2 / 3;
-    win_h = h / 2;
-    if (win_w < 240) win_w = w > 24 ? w - 24 : w;
-    if (win_h < 130) win_h = h > 90 ? h - 90 : h;
-    win_x = (w - win_w) / 2;
-    win_y = (h - win_h) / 2;
-    rectangle(win_x + 5, win_y + 6, win_w, win_h, 10, 15, 28);
-    rectangle(win_x, win_y, win_w, win_h, 54, 68, 96);
-    rectangle(win_x, win_y, win_w, 38, 33, 44, 66);
-    rectangle(win_x, win_y + 37, win_w, 1, 82, 101, 135);
-
-    rectangle(win_x + 14, win_y + 14, 10, 10, 255, 103, 119);
-    rectangle(win_x + 32, win_y + 14, 10, 10, 255, 195, 91);
-    rectangle(win_x + 50, win_y + 14, 10, 10, 95, 222, 155);
-    draw_text(win_x + 76, win_y + 16, "VERITASOS DESKTOP", 242, 245, 255);
-
-    draw_text(win_x + 24, win_y + 64, "WELCOME TO VERITASOS", 247, 249, 255);
-    draw_text(win_x + 24, win_y + 86, "A DESKTOP BUILT FROM C", 183, 205, 237);
-    draw_text(win_x + 24, win_y + 108, "VERSION 0.2.0", 183, 205, 237);
-
-    rectangle(win_x + 24, win_y + 132, win_w > 60 ? win_w - 48 : 10, 1,
-              91, 111, 147);
-    draw_text(win_x + 24, win_y + 150, "INPUT STATUS", 242, 245, 255);
-    draw_text(win_x + 24, win_y + 170, status_message, 174, 208, 190);
-    if (input_length > 0) {
-        draw_text(win_x + 24, win_y + 192, "KEYS:", 183, 205, 237);
-        draw_text(win_x + 60, win_y + 192, input_line, 255, 215, 140);
+    if (show_desktop_icons) {
+        draw_icon(24, 76, "HOME", 89, 157, 255);
+        draw_icon(24, 134, "FILES", 100, 221, 163);
+        draw_icon(24, 192, "SETTINGS", 255, 190, 92);
     }
+    draw_window();
 
-    /* Bottom dock. */
-    dock_w = 202;
-    dock_h = 48;
+    dock_w = 226; dock_h = 48;
     dock_x = (w - dock_w) / 2;
-    dock_y = h - dock_h - 18;
+    dock_y = h - dock_h - 12;
     rectangle(dock_x, dock_y, dock_w, dock_h, 10, 15, 27);
     rectangle(dock_x, dock_y, dock_w, 1, 60, 79, 111);
-    rectangle(dock_x + 17, dock_y + 13, 22, 22, 89, 157, 255);
-    rectangle(dock_x + 51, dock_y + 13, 22, 22, 100, 221, 163);
-    rectangle(dock_x + 85, dock_y + 13, 22, 22, 255, 190, 92);
-    rectangle(dock_x + 119, dock_y + 13, 22, 22, 186, 133, 255);
-    rectangle(dock_x + 153, dock_y + 13, 22, 22, 255, 112, 133);
+    rectangle(dock_x + 14, dock_y + 12, 26, 24, 89, 157, 255);
+    rectangle(dock_x + 51, dock_y + 12, 26, 24, 100, 221, 163);
+    rectangle(dock_x + 88, dock_y + 12, 26, 24, 255, 190, 92);
+    rectangle(dock_x + 125, dock_y + 12, 26, 24, 186, 133, 255);
+    rectangle(dock_x + 162, dock_y + 12, 26, 24, 255, 112, 133);
+    draw_text(dock_x + 18, dock_y + 19, "H", 255, 255, 255);
+    draw_text(dock_x + 56, dock_y + 19, "F", 255, 255, 255);
+    draw_text(dock_x + 93, dock_y + 19, "S", 35, 40, 50);
+    draw_text(dock_x + 130, dock_y + 19, "T", 255, 255, 255);
+    draw_text(dock_x + 167, dock_y + 19, "P", 255, 255, 255);
+
+    if (power_menu_open) {
+        int px = w - 184, py = 48;
+        rectangle(px, py, 170, 82, 10, 15, 27);
+        rectangle(px, py, 170, 1, 90, 112, 148);
+        draw_text(px + 12, py + 14, "POWER MENU", 240, 244, 255);
+        draw_text(px + 12, py + 36, "REBOOT", 174, 208, 190);
+        draw_text(px + 12, py + 58, "SHUT DOWN", 255, 190, 170);
+    }
 }
 
 static void redraw(void) {
@@ -383,18 +478,37 @@ static void handle_key(uint8_t sc) {
     redraw();
 }
 
+static void reboot_system(void) {
+    /* Ask the PS/2 controller to pulse the CPU reset line. */
+    for (unsigned i = 0; i < 100000; ++i) {
+        if ((inb(0x64) & 0x02u) == 0) break;
+    }
+    outb(0x64, 0xFE);
+    for (;;) __asm__ volatile ("cli; hlt");
+}
+
+static void shutdown_system(void) {
+    status_message = "SHUTDOWN REQUESTED - YOU MAY CLOSE THE VM";
+    power_menu_open = false;
+    redraw();
+    /* ACPI power-off is not implemented yet; halt safely instead. */
+    __asm__ volatile ("cli");
+    for (;;) __asm__ volatile ("hlt");
+}
+
+static void open_window(enum window_kind kind) {
+    active_window = kind;
+    power_menu_open = false;
+    win_x = 0;
+    win_y = 0;
+    redraw();
+}
+
 static void handle_mouse_packet(void) {
-    int old_x = mouse_x;
-    int old_y = mouse_y;
+    int old_x = mouse_x, old_y = mouse_y;
     int dx = (int)(int8_t)mouse_packet[1];
     int dy = (int)(int8_t)mouse_packet[2];
-
-    /* Ignore overflow packets; their movement deltas are not reliable. */
-    if ((mouse_packet[0] & 0xC0u) == 0) {
-        mouse_x += dx;
-        mouse_y -= dy;
-    }
-
+    if ((mouse_packet[0] & 0xC0u) == 0) { mouse_x += dx; mouse_y -= dy; }
     if (mouse_x < 0) mouse_x = 0;
     if (mouse_y < 0) mouse_y = 0;
     if (mouse_x >= (int)screen_w) mouse_x = (int)screen_w - 1;
@@ -404,23 +518,62 @@ static void handle_mouse_packet(void) {
     bool left_click = left_button && !previous_left_button;
     previous_left_button = left_button;
 
-    if (left_click) {
-        if (mouse_x >= dock_x && mouse_x < dock_x + dock_w &&
-            mouse_y >= dock_y && mouse_y < dock_y + dock_h) {
-            status_message = "DOCK ICON CLICKED";
-        } else if (mouse_x >= win_x && mouse_x < win_x + win_w &&
-                   mouse_y >= win_y && mouse_y < win_y + 38) {
-            status_message = "WINDOW TITLE BAR CLICKED";
-        } else {
-            status_message = "DESKTOP CLICKED";
-        }
-        restore_cursor();
-        draw_desktop();
-        draw_cursor(mouse_x, mouse_y);
+    if (dragging_window && left_button && active_window != WIN_NONE) {
+        win_x = mouse_x - drag_offset_x;
+        win_y = mouse_y - drag_offset_y;
+        if (win_x < 0) win_x = 0;
+        if (win_y < 42) win_y = 42;
+        if (win_x + win_w > (int)screen_w) win_x = (int)screen_w - win_w;
+        if (win_y + win_h > (int)screen_h - 60) win_y = (int)screen_h - 60 - win_h;
+        redraw();
         return;
     }
+    if (!left_button) dragging_window = false;
 
-    /* On movement, restore only the old cursor area and draw the new cursor. */
+    if (left_click) {
+        int x = mouse_x, y = mouse_y;
+        if (power_menu_open) {
+            int px = (int)screen_w - 184, py = 48;
+            power_menu_open = false;
+            if (x >= px && x < px + 170 && y >= py + 28 && y < py + 52) reboot_system();
+            if (x >= px && x < px + 170 && y >= py + 52 && y < py + 80) shutdown_system();
+            redraw(); return;
+        }
+        if (y >= dock_y && y < dock_y + dock_h && x >= dock_x && x < dock_x + dock_w) {
+            int slot = (x - dock_x) / 37;
+            if (slot == 0) open_window(WIN_HOME);
+            else if (slot == 1) open_window(WIN_FILES);
+            else if (slot == 2) open_window(WIN_SETTINGS);
+            else if (slot == 3) { active_window = WIN_NONE; power_menu_open = false; redraw(); }
+            else { power_menu_open = !power_menu_open; redraw(); }
+            return;
+        }
+        if (show_desktop_icons && x >= 15 && x < 100) {
+            if (y >= 70 && y < 126) { open_window(WIN_HOME); return; }
+            if (y >= 128 && y < 184) { open_window(WIN_FILES); return; }
+            if (y >= 186 && y < 242) { open_window(WIN_SETTINGS); return; }
+        }
+        if (active_window != WIN_NONE && x >= win_x && x < win_x + win_w &&
+            y >= win_y && y < win_y + 38) {
+            if (x < win_x + 27) { active_window = WIN_NONE; redraw(); return; }
+            dragging_window = true;
+            drag_offset_x = x - win_x;
+            drag_offset_y = y - win_y;
+            status_message = "WINDOW MOVED WITH MOUSE";
+            redraw(); return;
+        }
+        if (active_window == WIN_SETTINGS && x >= win_x && x < win_x + win_w &&
+            y >= win_y + 45 && y < win_y + win_h) {
+            if (y < win_y + 110) dark_theme = !dark_theme;
+            else if (y < win_y + 140) show_clock = !show_clock;
+            else show_desktop_icons = !show_desktop_icons;
+            redraw(); return;
+        }
+        if (x >= (int)screen_w - 80 && y < 42) { power_menu_open = true; redraw(); return; }
+        status_message = "DESKTOP CLICKED";
+        redraw(); return;
+    }
+
     if (mouse_x != old_x || mouse_y != old_y) {
         restore_cursor();
         draw_cursor(mouse_x, mouse_y);
