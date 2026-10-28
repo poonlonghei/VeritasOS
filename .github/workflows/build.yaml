@@ -28,6 +28,9 @@ jobs:
             --branch=v8.x-binary \
             https://github.com/limine-bootloader/limine.git limine
 
+          echo "Building the Linux Limine utility..."
+          make -C limine
+
           echo "Checking Limine files..."
           ls -la limine/
 
@@ -36,9 +39,7 @@ jobs:
           test -f limine/limine-bios-cd.bin
           test -f limine/limine-uefi-cd.bin
           test -f limine/BOOTX64.EFI
-          test -f limine/limine
-
-          chmod +x limine/limine
+          test -x limine/limine
 
       - name: Build VeritasOS
         run: make iso CC=gcc
