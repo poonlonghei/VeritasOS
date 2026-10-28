@@ -23,6 +23,11 @@ static struct limine_framebuffer *fb;
 static uint64_t screen_w, screen_h;
 static int mouse_x, mouse_y;
 static bool mouse_initialized;
+#define CURSOR_SIZE 13
+static uint32_t cursor_background[CURSOR_SIZE * CURSOR_SIZE];
+static int old_cursor_x, old_cursor_y;
+static bool cursor_visible;
+static bool previous_left_button;
 static uint8_t mouse_packet[3];
 static unsigned mouse_packet_index;
 static char input_line[48];
@@ -75,25 +80,74 @@ static bool mouse_read(uint8_t *value) {
     return true;
 }
 
-static bool mouse_write(uint8_t value) {
+static bool controller_read_config(uint8_t *value) {
     if (!wait_input_clear()) return false;
-    outb(0x64, 0xD4);
+    outb(0x64, 0x20); /* Read PS/2 controller configuration byte. */
+    if (!wait_output_full()) return false;
+    *value = inb(0x60);
+    return true;
+}
+
+static bool controller_write_config(uint8_t value) {
+    if (!wait_input_clear()) return false;
+    outb(0x64, 0x60); /* Write PS/2 controller configuration byte. */
     if (!wait_input_clear()) return false;
     outb(0x60, value);
-    if (!wait_output_full()) return false;
-    uint8_t response = inb(0x60);
-    return response == 0xFA;
+    io_wait();
+    return true;
+}
+
+static bool mouse_write(uint8_t value) {
+    if (!wait_input_clear()) return false;
+    outb(0x64, 0xD4); /* Next byte goes to the auxiliary device. */
+    if (!wait_input_clear()) return false;
+    outb(0x60, value);
+
+    /* Ignore unrelated bytes until the mouse acknowledges or times out. */
+    for (unsigned i = 0; i < 100000; ++i) {
+        if (inb(0x64) & 0x01u) {
+            uint8_t response = inb(0x60);
+            if (response == 0xFA) return true;
+            if (response == 0xFE) return false; /* Resend requested. */
+        }
+    }
+    return false;
+}
+
+static bool initialize_ps2_controller(void) {
+    /* Disable both ports while configuring the controller. */
+    if (!wait_input_clear()) return false;
+    outb(0x64, 0xAD); /* Disable first (keyboard) port. */
+    if (!wait_input_clear()) return false;
+    outb(0x64, 0xA7); /* Disable second (mouse) port. */
+
+    /* Drain stale output bytes before issuing controller commands. */
+    for (unsigned i = 0; i < 32 && (inb(0x64) & 0x01u); ++i)
+        (void)inb(0x60);
+
+    uint8_t config;
+    if (!controller_read_config(&config)) return false;
+
+    /* Use polling: disable IRQ bits, enable both ports, enable set-1 translation. */
+    config &= (uint8_t)~0x03u; /* IRQ1 and IRQ12 off; this kernel polls. */
+    config &= (uint8_t)~0x30u; /* Clear keyboard/mouse clock-disable bits. */
+    config |= 0x40u;           /* Translate keyboard scan codes to set 1. */
+    if (!controller_write_config(config)) return false;
+
+    if (!wait_input_clear()) return false;
+    outb(0x64, 0xAE); /* Enable keyboard port. */
+    if (!wait_input_clear()) return false;
+    outb(0x64, 0xA8); /* Enable mouse port. */
+    io_wait();
+    return true;
 }
 
 static void initialize_ps2_mouse(void) {
-    /* Enable the auxiliary PS/2 port, then reset defaults and enable reporting. */
-    if (!wait_input_clear()) return;
-    outb(0x64, 0xA8);
-    io_wait();
+    if (!initialize_ps2_controller()) return;
 
-    if (mouse_write(0xF6) && mouse_write(0xF4)) {
+    /* Reset defaults and enable mouse packet reporting. */
+    if (mouse_write(0xF6) && mouse_write(0xF4))
         mouse_initialized = true;
-    }
 }
 
 static uint32_t channel(uint8_t value, uint8_t size, uint8_t shift) {
@@ -169,16 +223,60 @@ static void draw_text(int x, int y, const char *text,
     }
 }
 
-static void draw_cursor(int x, int y) {
-    /* Simple white pointer with a dark outline. */
-    for (int i = 0; i < 13; ++i) {
-        pixel((uint64_t)x, (uint64_t)(y + i), 15, 20, 32);
-        pixel((uint64_t)(x + 1), (uint64_t)(y + i), 245, 248, 255);
-        if (i < 8) {
-            pixel((uint64_t)(x + i), (uint64_t)(y + i), 15, 20, 32);
-            pixel((uint64_t)(x + i + 1), (uint64_t)(y + i), 245, 248, 255);
+static void restore_cursor(void) {
+    if (!cursor_visible) return;
+
+    for (int dy = 0; dy < CURSOR_SIZE; ++dy) {
+        for (int dx = 0; dx < CURSOR_SIZE; ++dx) {
+            int px = old_cursor_x + dx;
+            int py = old_cursor_y + dy;
+            if (px < 0 || py < 0 ||
+                px >= (int)fb->width || py >= (int)fb->height) continue;
+
+            volatile uint32_t *row = (volatile uint32_t *)(
+                (uint8_t *)fb->address + (uint64_t)py * fb->pitch);
+            row[px] = cursor_background[dy * CURSOR_SIZE + dx];
         }
     }
+    cursor_visible = false;
+}
+
+static void draw_cursor(int x, int y) {
+    old_cursor_x = x;
+    old_cursor_y = y;
+
+    /* Save the framebuffer pixels beneath the cursor before drawing it. */
+    for (int dy = 0; dy < CURSOR_SIZE; ++dy) {
+        for (int dx = 0; dx < CURSOR_SIZE; ++dx) {
+            int px = x + dx;
+            int py = y + dy;
+            uint32_t saved = 0;
+            if (px >= 0 && py >= 0 &&
+                px < (int)fb->width && py < (int)fb->height) {
+                volatile uint32_t *row = (volatile uint32_t *)(
+                    (uint8_t *)fb->address + (uint64_t)py * fb->pitch);
+                saved = row[px];
+            }
+            cursor_background[dy * CURSOR_SIZE + dx] = saved;
+        }
+    }
+
+    /* A small arrow-shaped pointer. */
+    for (int i = 0; i < CURSOR_SIZE; ++i) {
+        if (x >= 0 && x < (int)screen_w && y + i >= 0 && y + i < (int)screen_h)
+            pixel((uint64_t)x, (uint64_t)(y + i), 15, 20, 32);
+        if (i < 8) {
+            for (int j = 0; j <= i; ++j) {
+                int px = x + j, py = y + i;
+                if (px >= 0 && py >= 0 && px < (int)screen_w && py < (int)screen_h)
+                    pixel((uint64_t)px, (uint64_t)py, 245, 248, 255);
+            }
+        } else if (x + 1 >= 0 && x + 1 < (int)screen_w &&
+                   y + i >= 0 && y + i < (int)screen_h) {
+            pixel((uint64_t)(x + 1), (uint64_t)(y + i), 245, 248, 255);
+        }
+    }
+    cursor_visible = true;
 }
 
 static int win_x, win_y, win_w, win_h;
@@ -244,6 +342,8 @@ static void draw_desktop(void) {
 }
 
 static void redraw(void) {
+    /* Full redraws are reserved for actual UI changes, such as keyboard input. */
+    cursor_visible = false;
     draw_desktop();
     draw_cursor(mouse_x, mouse_y);
 }
@@ -284,17 +384,27 @@ static void handle_key(uint8_t sc) {
 }
 
 static void handle_mouse_packet(void) {
+    int old_x = mouse_x;
+    int old_y = mouse_y;
     int dx = (int)(int8_t)mouse_packet[1];
     int dy = (int)(int8_t)mouse_packet[2];
-    mouse_x += dx;
-    mouse_y -= dy;
+
+    /* Ignore overflow packets; their movement deltas are not reliable. */
+    if ((mouse_packet[0] & 0xC0u) == 0) {
+        mouse_x += dx;
+        mouse_y -= dy;
+    }
 
     if (mouse_x < 0) mouse_x = 0;
     if (mouse_y < 0) mouse_y = 0;
     if (mouse_x >= (int)screen_w) mouse_x = (int)screen_w - 1;
     if (mouse_y >= (int)screen_h) mouse_y = (int)screen_h - 1;
 
-    if (mouse_packet[0] & 0x01u) {
+    bool left_button = (mouse_packet[0] & 0x01u) != 0;
+    bool left_click = left_button && !previous_left_button;
+    previous_left_button = left_button;
+
+    if (left_click) {
         if (mouse_x >= dock_x && mouse_x < dock_x + dock_w &&
             mouse_y >= dock_y && mouse_y < dock_y + dock_h) {
             status_message = "DOCK ICON CLICKED";
@@ -304,8 +414,17 @@ static void handle_mouse_packet(void) {
         } else {
             status_message = "DESKTOP CLICKED";
         }
+        restore_cursor();
+        draw_desktop();
+        draw_cursor(mouse_x, mouse_y);
+        return;
     }
-    redraw();
+
+    /* On movement, restore only the old cursor area and draw the new cursor. */
+    if (mouse_x != old_x || mouse_y != old_y) {
+        restore_cursor();
+        draw_cursor(mouse_x, mouse_y);
+    }
 }
 
 void kmain(void) {
@@ -329,7 +448,7 @@ void kmain(void) {
     draw_cursor(mouse_x, mouse_y);
     initialize_ps2_mouse();
     if (!mouse_initialized)
-        status_message = "KEYBOARD READY - PS/2 MOUSE NOT DETECTED";
+        status_message = "KEYBOARD POLLING ACTIVE - MOUSE NOT DETECTED";
     redraw();
 
     /* Poll input without requiring an IDT or interrupt handlers yet. */
