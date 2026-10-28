@@ -12,11 +12,15 @@
 
 /* =========================================
    Limine Boot Protocol Requests
+
+   IMPORTANT:
+   The Limine marker macros already contain
+   their own variable declarations.
+   Do not use them as array initializers.
    ========================================= */
 
 __attribute__((used, section(".limine_requests_start")))
-static volatile uint64_t requests_start[] =
-    LIMINE_REQUESTS_START_MARKER;
+static volatile LIMINE_REQUESTS_START_MARKER;
 
 __attribute__((used, section(".limine_requests")))
 static volatile LIMINE_BASE_REVISION(3);
@@ -28,8 +32,7 @@ static volatile struct limine_framebuffer_request framebuffer_request = {
 };
 
 __attribute__((used, section(".limine_requests_end")))
-static volatile uint64_t requests_end[] =
-    LIMINE_REQUESTS_END_MARKER;
+static volatile LIMINE_REQUESTS_END_MARKER;
 
 /* =========================================
    Framebuffer
@@ -101,6 +104,7 @@ static void rectangle(uint64_t x, uint64_t y,
 
 /* =========================================
    Built-in 5x7 Bitmap Font
+
    Supports uppercase letters, digits,
    spaces, and selected punctuation.
    ========================================= */
@@ -315,9 +319,11 @@ void kmain(void)
 
     uint64_t dock_w = 240;
     uint64_t dock_h = 42;
+
     uint64_t dock_x = (w > dock_w)
                     ? (w - dock_w) / 2
                     : 0;
+
     uint64_t dock_y = (h > dock_h + 20)
                     ? h - dock_h - 20
                     : 0;
