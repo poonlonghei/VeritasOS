@@ -25,7 +25,18 @@ jobs:
           git clone --depth=1 \
             --branch=v8.x-binary \
             https://github.com/limine-bootloader/limine.git limine
-          make -C limine
+
+          echo "Checking Limine files..."
+          ls -la limine/
+
+          test -f limine/limine.h
+          test -f limine/limine-bios.sys
+          test -f limine/limine-bios-cd.bin
+          test -f limine/limine-uefi-cd.bin
+          test -f limine/BOOTX64.EFI
+          test -f limine/limine
+
+          chmod +x limine/limine
 
       - name: Build VeritasOS
         run: make iso CC=gcc
