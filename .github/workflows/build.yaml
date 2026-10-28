@@ -1,5 +1,38 @@
+
+name: Build VeritasOS
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build operating system
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git xorriso mtools
+
+      - name: Download Limine
+        run: |
+          git clone --depth=1 \
+            --branch=v8.x-binary \
+            https://github.com/limine-bootloader/limine.git limine
+          make -C limine
+
+      - name: Build VeritasOS
+        run: make iso CC=gcc
+
       - name: Upload bootable ISO
         uses: actions/upload-artifact@v4
         with:
           name: veritasos-iso
           path: veritasos.iso
+          if-no-files-found: error
