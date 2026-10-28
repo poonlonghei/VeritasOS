@@ -19,9 +19,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential git xorriso mtools
-
+      
       - name: Download Limine
         run: |
+          rm -rf limine
+
           git clone --depth=1 \
             --branch=v8.x-binary \
             https://github.com/limine-bootloader/limine.git limine
